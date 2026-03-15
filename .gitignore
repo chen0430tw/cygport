@@ -1,0 +1,7 @@
+# Build artifacts
+cygctl1/obj/
+cygctl1/dist/
+cygnet/*.dll
+cygnet/*.a
+cygnet/src/*.o
+cygnet/test_ifname.exe
