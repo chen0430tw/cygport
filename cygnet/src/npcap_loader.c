@@ -19,8 +19,37 @@
 #include <pcap.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "cygnet_internal.h"
+
+/*
+ * Npcap is a Windows DLL — its pcap_pkthdr uses Windows struct timeval:
+ *   tv_sec  = 32-bit long (4 bytes)
+ *   tv_usec = 32-bit long (4 bytes)
+ *   total   = 8 bytes
+ *
+ * Cygwin defines struct timeval with 64-bit time_t / suseconds_t:
+ *   tv_sec  = 64-bit (8 bytes)
+ *   tv_usec = 64-bit (8 bytes)
+ *   total   = 16 bytes
+ *
+ * pcap_pkthdr returned by Npcap must be converted before handing to Cygwin.
+ */
+typedef struct {
+    uint32_t tv_sec;
+    uint32_t tv_usec;
+    uint32_t caplen;
+    uint32_t len;
+} NpcapPkthdr;
+
+static void npcap_hdr_to_cygwin(const NpcapPkthdr *src, struct pcap_pkthdr *dst)
+{
+    dst->ts.tv_sec  = (time_t)src->tv_sec;
+    dst->ts.tv_usec = (suseconds_t)src->tv_usec;
+    dst->caplen     = src->caplen;
+    dst->len        = src->len;
+}
 
 /* ── Npcap probe paths (in priority order) ───────────────────────────────── */
 static const char *NPCAP_PATHS[] = {
@@ -174,7 +203,6 @@ pcap_t *pcap_open_live(const char *device, int snaplen,
 {
     ensure_loaded();
 
-    /* Translate dnet name → NPF path */
     char npfdev[256];
     const char *dev = device;
     if (cygnet_ifname_to_npf(device, npfdev, sizeof(npfdev)))
@@ -253,15 +281,46 @@ void pcap_freecode(struct bpf_program *fp)
 int pcap_next_ex(pcap_t *p, struct pcap_pkthdr **hdr, const u_char **data)
 {
     ensure_loaded();
-    if (npcap_loaded == 1 && npcap.next_ex) return npcap.next_ex(p, hdr, data);
-    return cygnet_windivert_next_ex(p, hdr, data);
+    if (npcap_loaded != 1 || !npcap.next_ex)
+        return cygnet_windivert_next_ex(p, hdr, data);
+
+    /* Npcap returns a pointer to its internal NpcapPkthdr (32-bit timeval).
+     * Convert to Cygwin pcap_pkthdr (64-bit timeval) before returning. */
+    NpcapPkthdr *whdr = NULL;
+    int ret = npcap.next_ex(p, (struct pcap_pkthdr **)&whdr, data);
+    if (ret == 1 && whdr) {
+        static struct pcap_pkthdr converted;
+        npcap_hdr_to_cygwin(whdr, &converted);
+        *hdr = &converted;
+    }
+    return ret;
+}
+
+/* Wrapper state for pcap_dispatch callback conversion */
+typedef struct {
+    pcap_handler real_cb;
+    u_char      *real_user;
+} DispatchWrap;
+
+static void dispatch_cb_wrapper(u_char *arg,
+                                 const struct pcap_pkthdr *raw_hdr,
+                                 const u_char *data)
+{
+    /* raw_hdr points to Npcap's NpcapPkthdr — convert before calling Cygwin cb */
+    DispatchWrap *w = (DispatchWrap *)arg;
+    struct pcap_pkthdr converted;
+    npcap_hdr_to_cygwin((const NpcapPkthdr *)raw_hdr, &converted);
+    w->real_cb(w->real_user, &converted, data);
 }
 
 int pcap_dispatch(pcap_t *p, int cnt, pcap_handler cb, u_char *user)
 {
     ensure_loaded();
-    if (npcap_loaded == 1 && npcap.dispatch) return npcap.dispatch(p, cnt, cb, user);
-    return cygnet_windivert_dispatch(p, cnt, cb, user);
+    if (npcap_loaded != 1 || !npcap.dispatch)
+        return cygnet_windivert_dispatch(p, cnt, cb, user);
+
+    DispatchWrap w = { cb, user };
+    return npcap.dispatch(p, cnt, dispatch_cb_wrapper, (u_char *)&w);
 }
 
 void pcap_breakloop(pcap_t *p)
@@ -294,18 +353,14 @@ int pcap_findalldevs(pcap_if_t **alldevs, char *errbuf)
     else
         ret = cygnet_windivert_findalldevs(alldevs, errbuf);
 
-    /* Post-process: add dnet-style name aliases to each device */
+    /* Post-process: add dnet-style name aliases to each device.
+     * NOTE: Do NOT free/replace d->description — those strings belong to
+     * Npcap's allocator; freeing them with Cygwin's free() causes heap
+     * corruption when npcap.freealldevs later tries to free them. */
     if (ret == 0 && alldevs) {
         for (pcap_if_t *d = *alldevs; d; d = d->next) {
             char ifname[64];
-            if (cygnet_npf_to_ifname(d->name, ifname, sizeof(ifname))) {
-                /* Prepend short name to description for tool display */
-                char desc[512];
-                snprintf(desc, sizeof(desc), "[%s] %s",
-                         ifname, d->description ? d->description : "");
-                free(d->description);
-                d->description = strdup(desc);
-            }
+            cygnet_npf_to_ifname(d->name, ifname, sizeof(ifname));
         }
     }
     return ret;

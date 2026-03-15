@@ -124,18 +124,18 @@ static void build_cache(void)
 
     if (rc != NO_ERROR) { free(addrs); return; }
 
-    /* ── Step 2: Enumerate Npcap devices ───────────────────────────────── */
-    pcap_if_t *devs = NULL;
-    char errbuf[PCAP_ERRBUF_SIZE];
-    /* Use lazy-loaded Npcap; if unavailable, NPF map will be empty */
-    int has_pcap = (cygnet_npcap_pcap_findalldevs(&devs, errbuf) == 0);
-
-    /* ── Step 3: Match adapter → NPF device by GUID ────────────────────── */
+    /* ── Step 2: Build NPF paths directly from adapter GUIDs ───────────── */
     /*
      * Npcap NPF device names look like:
      *   \Device\NPF_{3B4ABCD1-1234-...}
      * Windows adapter AdapterName is:
      *   {3B4ABCD1-1234-...}   (GUID without \Device\NPF_ prefix)
+     *
+     * We construct the NPF path directly from the GUID — no pcap_findalldevs
+     * needed. Calling pcap_findalldevs here would cause a deadlock/hang because
+     * this function is invoked from within pcap_open_live (via ensure_loaded →
+     * cygnet_ifname_to_npf → build_cache), and some Npcap versions block
+     * indefinitely in pcap_findalldevs when called from an elevated process.
      */
     int eth_idx = 0, lo_idx = 0, wlan_idx = 0, other_idx = 0;
 
@@ -171,31 +171,12 @@ static void build_cache(void)
             break;
         }
 
-        /* Build expected NPF path from adapter GUID */
-        char expected_npf[NPF_MAX];
-        snprintf(expected_npf, sizeof(expected_npf),
-                 "\\Device\\NPF_%s", a->AdapterName);
-
-        /* Try to find matching Npcap device */
-        if (has_pcap) {
-            for (pcap_if_t *d = devs; d; d = d->next) {
-                if (strcasecmp(d->name, expected_npf) == 0) {
-                    strncpy(e->npf, d->name, NPF_MAX - 1);
-                    break;
-                }
-            }
-        }
-
-        /* If no Npcap match, still store the expected NPF path */
-        if (e->npf[0] == '\0') {
-            snprintf(e->npf, NPF_MAX, "%s", expected_npf);
-        }
+        /* Build NPF path directly from adapter GUID */
+        snprintf(e->npf, NPF_MAX, "\\Device\\NPF_%s", a->AdapterName);
 
         cache_sz++;
     }
 
-    if (has_pcap && devs)
-        cygnet_npcap_pcap_freealldevs(devs);
     free(addrs);
 }
 
