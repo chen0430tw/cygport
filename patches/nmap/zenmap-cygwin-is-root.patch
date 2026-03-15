@@ -1,0 +1,12 @@
+--- a/zenmap/zenmapGUI/App.py
++++ b/zenmap/zenmapGUI/App.py
+@@ -143,7 +143,8 @@ def is_root():
+     if 'NMAP_PRIVILEGED' in os.environ:
+         return True
+     elif 'NMAP_UNPRIVILEGED' in os.environ:
+         return False
+     else:
+-        return sys.platform == "win32" or os.getuid() == 0 or is_maemo()
++        # On Cygwin, os.getuid() reflects the Cygwin UID, not Windows privilege
++        # level. Treat Cygwin the same as win32: skip Unix-style root check.
++        return sys.platform in ("win32", "cygwin") or os.getuid() == 0 or is_maemo()
