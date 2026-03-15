@@ -2,6 +2,26 @@
 
 Cygwin 网络工具移植运行时。提供在 Cygwin 环境下移植 Linux 网络工具（nmap、tcpdump 等）所需的底层库和头文件。
 
+## 背景
+
+2001 年，有人在 nmap 开发邮件列表问：「nmap 能用 Cygwin 的 gcc 编译吗？」
+
+开发者的回答是：Unix 的 routing/pcap 算法在 Windows 上不工作。这条路就此搁置。
+
+此后 20 年，社区里所谓的「nmap on Cygwin」方案，始终停留在：
+
+```bash
+alias nmap="C:/Program Files (x86)/Nmap/nmap.exe"
+```
+
+一个指向 Windows 原生二进制的 alias，从未有人真正移植过。nmap 官方文档至今写道：
+
+> "Nmap doesn't maintain instructions for building Nmap under Cygwin."
+
+WinDivert 出现后，内核级数据包拦截在用户态变得可行。Npcap 取代了老旧的 WinPcap。技术条件早已成熟，但没有人把这些拼在一起。
+
+cygport 是这个空白的答案：一套让 Linux 网络工具在 Cygwin 上原生编译、原生运行的基础设施。不是 alias，不是 wrapper，是真正的移植。
+
 ## 组件
 
 | 组件 | 编译器 | 说明 |
