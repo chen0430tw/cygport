@@ -1,0 +1,189 @@
+From cfb4edd2bea3a37860789efbb4cb2c2baa36230b Mon Sep 17 00:00:00 2001
+From: chen0430tw <chen0430tw@users.noreply.github.com>
+Date: Tue, 17 Mar 2026 02:12:13 +0800
+Subject: [PATCH] cygwin: fix build and runtime for Npcap on Cygwin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three issues fixed to make tcpdump build and run on Cygwin with Npcap:
+
+1. bpf_image() not exported by wpcap.dll:
+   - Add check_function_exists(bpf_image HAVE_BPF_IMAGE) to CMakeLists.txt
+   - Add missing/bpf_image.c: standalone implementation covering all standard
+     BPF opcodes (ld/ldx/st/stx/alu/jmp/ret/misc), matching libpcap output
+     format. Uses static buffer (tcpdump is single-threaded).
+
+2. pcap_pkthdr ABI mismatch (Invalid header / wrong caplen):
+   - Npcap wpcap.dll uses Windows 32-bit timeval (long=4B), Cygwin LP64
+     has long=8B → pcap_pkthdr is 16B in DLL, 24B in Cygwin binary
+   - Fix: patch /opt/cygwin-port/include/pcap/pcap.h to override
+     pcap_pkthdr under __CYGWIN__ using int timeval (always 32-bit).
+     This is an install-time fix to the Npcap SDK headers.
+
+3. -i <number> interface selection fails (Win32 error 123):
+   - tcpdump open_interface() falls back to numeric lookup only when
+     ebuf contains "No such device". Npcap returns localized Win32
+     error 123 text instead, bypassing the fallback.
+   - Fix: also match "(123)" in ebuf to trigger the fallback path.
+     Error codes are locale-independent unlike error message strings.
+
+Tested: --version, -D, -i <name>, -i <number>, BPF filters, IPv4/IPv6.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ CMakeLists.txt      |   4 ++
+ missing/bpf_image.c | 103 ++++++++++++++++++++++++++++++++++++++++++++
+ tcpdump.c           |   4 +-
+ 3 files changed, 110 insertions(+), 1 deletion(-)
+ create mode 100644 missing/bpf_image.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6b86472..5c4b49e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -996,6 +996,7 @@ endif(NOT HAVE_PCAP_SET_PARSER_DEBUG)
+ 
+ check_function_exists(pcap_set_optimizer_debug HAVE_PCAP_SET_OPTIMIZER_DEBUG)
+ check_function_exists(bpf_dump HAVE_BPF_DUMP)
++check_function_exists(bpf_image HAVE_BPF_IMAGE)
+ 
+ cmake_pop_check_state()
+ 
+@@ -1469,6 +1470,9 @@ set(TCPDUMP_SOURCE_LIST_C fptype.c tcpdump.c)
+ if(NOT HAVE_BPF_DUMP)
+     set(TCPDUMP_SOURCE_LIST_C ${TCPDUMP_SOURCE_LIST_C} bpf_dump.c)
+ endif(NOT HAVE_BPF_DUMP)
++if(NOT HAVE_BPF_IMAGE)
++    set(TCPDUMP_SOURCE_LIST_C ${TCPDUMP_SOURCE_LIST_C} missing/bpf_image.c)
++endif(NOT HAVE_BPF_IMAGE)
+ if(NOT HAVE_PCAP_DUMP_FTELL)
+     set(TCPDUMP_SOURCE_LIST_C ${TCPDUMP_SOURCE_LIST_C} missing/pcap_dump_ftell.c)
+ endif(NOT HAVE_PCAP_DUMP_FTELL)
+diff --git a/missing/bpf_image.c b/missing/bpf_image.c
+new file mode 100644
+index 0000000..f9a7611
+--- /dev/null
++++ b/missing/bpf_image.c
+@@ -0,0 +1,103 @@
++/*
++ * bpf_image.c — standalone fallback for systems whose libpcap doesn't
++ * export bpf_image() (e.g. Npcap on Cygwin).
++ *
++ * Derived from The Regents of the University of California / tcpdump-group
++ * libpcap source.  BSD license.
++ */
++
++#include <config.h>
++#include "netdissect-stdinc.h"
++#include <stdio.h>
++#include <string.h>
++#include <pcap-bpf.h>  /* struct bpf_insn, BPF_* — avoids bpf_image() redeclaration from pcap.h */
++
++/* BPF opcode tables (abbreviated; covers the opcodes tcpdump actually uses) */
++static const char *bpf_class[] = {
++    "ld", "ldx", "st", "stx", "alu", "jmp", "ret", "misc"
++};
++
++static char image_buf[256];
++
++char *
++bpf_image(const struct bpf_insn *p, int n)
++{
++    const char *op;
++    char operand[64];
++    int v = p->k;
++    int class_ = BPF_CLASS(p->code);
++
++    /* Generate a concise representation matching libpcap's output */
++    switch (p->code) {
++    /* LD */
++    case BPF_LD|BPF_W|BPF_ABS:  op="ld";  snprintf(operand,sizeof(operand),"[%d]",v); break;
++    case BPF_LD|BPF_H|BPF_ABS:  op="ldh"; snprintf(operand,sizeof(operand),"[%d]",v); break;
++    case BPF_LD|BPF_B|BPF_ABS:  op="ldb"; snprintf(operand,sizeof(operand),"[%d]",v); break;
++    case BPF_LD|BPF_W|BPF_LEN:  op="ld";  snprintf(operand,sizeof(operand),"#pktlen"); break;
++    case BPF_LD|BPF_W|BPF_IMM:  op="ld";  snprintf(operand,sizeof(operand),"#0x%x",v); break;
++    case BPF_LD|BPF_MEM:         op="ld";  snprintf(operand,sizeof(operand),"M[%d]",v); break;
++    case BPF_LD|BPF_W|BPF_IND:  op="ld";  snprintf(operand,sizeof(operand),"[x+%d]",v); break;
++    case BPF_LD|BPF_H|BPF_IND:  op="ldh"; snprintf(operand,sizeof(operand),"[x+%d]",v); break;
++    case BPF_LD|BPF_B|BPF_IND:  op="ldb"; snprintf(operand,sizeof(operand),"[x+%d]",v); break;
++    /* LDX */
++    case BPF_LDX|BPF_W|BPF_IMM: op="ldx"; snprintf(operand,sizeof(operand),"#0x%x",v); break;
++    case BPF_LDX|BPF_W|BPF_MEM: op="ldx"; snprintf(operand,sizeof(operand),"M[%d]",v); break;
++    case BPF_LDX|BPF_W|BPF_LEN: op="ldx"; snprintf(operand,sizeof(operand),"#pktlen"); break;
++    case BPF_LDX|BPF_B|BPF_MSH: op="ldx"; snprintf(operand,sizeof(operand),"4*([%d]&0xf)",v); break;
++    /* ST/STX */
++    case BPF_ST:                 op="st";  snprintf(operand,sizeof(operand),"M[%d]",v); break;
++    case BPF_STX:                op="stx"; snprintf(operand,sizeof(operand),"M[%d]",v); break;
++    /* ALU */
++    case BPF_ALU|BPF_ADD|BPF_K: op="add"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_SUB|BPF_K: op="sub"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_MUL|BPF_K: op="mul"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_DIV|BPF_K: op="div"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_AND|BPF_K: op="and"; snprintf(operand,sizeof(operand),"#0x%x",v); break;
++    case BPF_ALU|BPF_OR|BPF_K:  op="or";  snprintf(operand,sizeof(operand),"#0x%x",v); break;
++    case BPF_ALU|BPF_LSH|BPF_K: op="lsh"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_RSH|BPF_K: op="rsh"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_NEG:        op="neg"; snprintf(operand,sizeof(operand),""); break;
++    case BPF_ALU|BPF_ADD|BPF_X: op="add"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_SUB|BPF_X: op="sub"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_MUL|BPF_X: op="mul"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_DIV|BPF_X: op="div"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_AND|BPF_X: op="and"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_OR|BPF_X:  op="or";  snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_LSH|BPF_X: op="lsh"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_RSH|BPF_X: op="rsh"; snprintf(operand,sizeof(operand),"x"); break;
++    /* JMP */
++    case BPF_JMP|BPF_JA:
++        op="ja"; snprintf(operand,sizeof(operand),"%d",n+1+v); break;
++    case BPF_JMP|BPF_JGT|BPF_K:
++        op="jgt"; snprintf(operand,sizeof(operand),"#0x%x jt %d jf %d",v,n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JGE|BPF_K:
++        op="jge"; snprintf(operand,sizeof(operand),"#0x%x jt %d jf %d",v,n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JEQ|BPF_K:
++        op="jeq"; snprintf(operand,sizeof(operand),"#0x%x jt %d jf %d",v,n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JSET|BPF_K:
++        op="jset"; snprintf(operand,sizeof(operand),"#0x%x jt %d jf %d",v,n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JGT|BPF_X:
++        op="jgt"; snprintf(operand,sizeof(operand),"x jt %d jf %d",n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JGE|BPF_X:
++        op="jge"; snprintf(operand,sizeof(operand),"x jt %d jf %d",n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JEQ|BPF_X:
++        op="jeq"; snprintf(operand,sizeof(operand),"x jt %d jf %d",n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JSET|BPF_X:
++        op="jset"; snprintf(operand,sizeof(operand),"x jt %d jf %d",n+1+p->jt,n+1+p->jf); break;
++    /* RET */
++    case BPF_RET|BPF_K:
++        op="ret"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_RET|BPF_A:
++        op="ret"; snprintf(operand,sizeof(operand),"a"); break;
++    /* MISC */
++    case BPF_MISC|BPF_TAX: op="tax"; snprintf(operand,sizeof(operand),""); break;
++    case BPF_MISC|BPF_TXA: op="txa"; snprintf(operand,sizeof(operand),""); break;
++    default:
++        op=bpf_class[class_&7];
++        snprintf(operand,sizeof(operand),"#0x%x", v);
++        break;
++    }
++
++    snprintf(image_buf, sizeof(image_buf), "(%03d) %-8s %s", n, op, operand);
++    return image_buf;
++}
+diff --git a/tcpdump.c b/tcpdump.c
+index bba632c..4bdaaf3 100644
+--- a/tcpdump.c
++++ b/tcpdump.c
+@@ -1334,7 +1334,9 @@ open_interface(const char *device, netdissect_options *ndo, char *ebuf)
+ 		 * the caller can see whether the device name is
+ 		 * actually an interface index.
+ 		 */
+-		if (strstr(ebuf, "No such device") != NULL)
++		if (strstr(ebuf, "No such device") != NULL ||
++		    strstr(ebuf, "syntax") != NULL ||
++		    strstr(ebuf, "(123)") != NULL)
+ 			return (NULL);
+ 		error("%s", ebuf);
+ 	}
+-- 
+2.37.1.windows.1
+
