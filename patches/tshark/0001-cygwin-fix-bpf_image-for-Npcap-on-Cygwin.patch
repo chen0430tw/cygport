@@ -1,0 +1,131 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index de2d023..fc86efd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3421,6 +3421,13 @@ if(BUILD_dumpcap AND PCAP_FOUND)
+ 	if (AIRPCAP_FOUND)
+ 		list(APPEND CAPUTILS_SRC capture/airpcap_loader.c)
+ 	endif()
++	# Check if libpcap exports bpf_image (Npcap on Cygwin does not).
++	include(CheckFunctionExists)
++	cmake_push_check_state()
++	set(CMAKE_REQUIRED_LIBRARIES ${PCAP_LIBRARIES})
++	check_function_exists(bpf_image HAVE_BPF_IMAGE)
++	cmake_pop_check_state()
++
+ 	set(dumpcap_FILES
+ 		capture_opts.c
+ 		cli_main.c
+@@ -3431,6 +3438,9 @@ if(BUILD_dumpcap AND PCAP_FOUND)
+ 		capture/ws80211_utils.c
+ 		${CAPUTILS_SRC}
+ 	)
++	if(NOT HAVE_BPF_IMAGE)
++		list(APPEND dumpcap_FILES missing/bpf_image.c)
++	endif()
+ 	set_executable_resources(dumpcap "Dumpcap" UNIQUE_RC)
+ 	add_executable(dumpcap ${dumpcap_FILES})
+ 	set_extra_executable_properties(dumpcap "Executables")
+diff --git a/missing/bpf_image.c b/missing/bpf_image.c
+new file mode 100644
+index 0000000..6cd3184
+--- /dev/null
++++ b/missing/bpf_image.c
+@@ -0,0 +1,97 @@
++/*
++ * bpf_image.c — standalone fallback for systems whose libpcap doesn't
++ * export bpf_image() (e.g. Npcap on Cygwin).
++ *
++ * Derived from The Regents of the University of California / tcpdump-group
++ * libpcap source.  BSD license.
++ */
++
++#include <config.h>
++#include <sys/types.h>  /* u_int, u_short for pcap-bpf.h */
++#include <stdio.h>
++#include <string.h>
++/* Include pcap-bpf.h directly to get bpf_insn without pulling in bpf_image()
++ * declaration from pcap.h (which would conflict with this definition). */
++#include <pcap-bpf.h>
++
++static char image_buf[256];
++
++char *
++bpf_image(const struct bpf_insn *p, int n)
++{
++    const char *op;
++    char operand[64];
++    int v = (int)p->k;
++
++    switch (p->code) {
++    /* LD */
++    case BPF_LD|BPF_W|BPF_ABS:  op="ld";  snprintf(operand,sizeof(operand),"[%d]",v); break;
++    case BPF_LD|BPF_H|BPF_ABS:  op="ldh"; snprintf(operand,sizeof(operand),"[%d]",v); break;
++    case BPF_LD|BPF_B|BPF_ABS:  op="ldb"; snprintf(operand,sizeof(operand),"[%d]",v); break;
++    case BPF_LD|BPF_W|BPF_LEN:  op="ld";  snprintf(operand,sizeof(operand),"#pktlen"); break;
++    case BPF_LD|BPF_W|BPF_IMM:  op="ld";  snprintf(operand,sizeof(operand),"#0x%x",v); break;
++    case BPF_LD|BPF_MEM:         op="ld";  snprintf(operand,sizeof(operand),"M[%d]",v); break;
++    case BPF_LD|BPF_W|BPF_IND:  op="ld";  snprintf(operand,sizeof(operand),"[x+%d]",v); break;
++    case BPF_LD|BPF_H|BPF_IND:  op="ldh"; snprintf(operand,sizeof(operand),"[x+%d]",v); break;
++    case BPF_LD|BPF_B|BPF_IND:  op="ldb"; snprintf(operand,sizeof(operand),"[x+%d]",v); break;
++    /* LDX */
++    case BPF_LDX|BPF_W|BPF_IMM: op="ldx"; snprintf(operand,sizeof(operand),"#0x%x",v); break;
++    case BPF_LDX|BPF_W|BPF_MEM: op="ldx"; snprintf(operand,sizeof(operand),"M[%d]",v); break;
++    case BPF_LDX|BPF_W|BPF_LEN: op="ldx"; snprintf(operand,sizeof(operand),"#pktlen"); break;
++    case BPF_LDX|BPF_B|BPF_MSH: op="ldx"; snprintf(operand,sizeof(operand),"4*([%d]&0xf)",v); break;
++    /* ST/STX */
++    case BPF_ST:                 op="st";  snprintf(operand,sizeof(operand),"M[%d]",v); break;
++    case BPF_STX:                op="stx"; snprintf(operand,sizeof(operand),"M[%d]",v); break;
++    /* ALU */
++    case BPF_ALU|BPF_ADD|BPF_K: op="add"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_SUB|BPF_K: op="sub"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_MUL|BPF_K: op="mul"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_DIV|BPF_K: op="div"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_AND|BPF_K: op="and"; snprintf(operand,sizeof(operand),"#0x%x",v); break;
++    case BPF_ALU|BPF_OR|BPF_K:  op="or";  snprintf(operand,sizeof(operand),"#0x%x",v); break;
++    case BPF_ALU|BPF_LSH|BPF_K: op="lsh"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_RSH|BPF_K: op="rsh"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_ALU|BPF_NEG:        op="neg"; snprintf(operand,sizeof(operand),""); break;
++    case BPF_ALU|BPF_ADD|BPF_X: op="add"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_SUB|BPF_X: op="sub"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_MUL|BPF_X: op="mul"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_DIV|BPF_X: op="div"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_AND|BPF_X: op="and"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_OR|BPF_X:  op="or";  snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_LSH|BPF_X: op="lsh"; snprintf(operand,sizeof(operand),"x"); break;
++    case BPF_ALU|BPF_RSH|BPF_X: op="rsh"; snprintf(operand,sizeof(operand),"x"); break;
++    /* JMP */
++    case BPF_JMP|BPF_JA:
++        op="ja"; snprintf(operand,sizeof(operand),"%d",n+1+v); break;
++    case BPF_JMP|BPF_JGT|BPF_K:
++        op="jgt"; snprintf(operand,sizeof(operand),"#0x%x jt %d jf %d",v,n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JGE|BPF_K:
++        op="jge"; snprintf(operand,sizeof(operand),"#0x%x jt %d jf %d",v,n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JEQ|BPF_K:
++        op="jeq"; snprintf(operand,sizeof(operand),"#0x%x jt %d jf %d",v,n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JSET|BPF_K:
++        op="jset"; snprintf(operand,sizeof(operand),"#0x%x jt %d jf %d",v,n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JGT|BPF_X:
++        op="jgt"; snprintf(operand,sizeof(operand),"x jt %d jf %d",n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JGE|BPF_X:
++        op="jge"; snprintf(operand,sizeof(operand),"x jt %d jf %d",n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JEQ|BPF_X:
++        op="jeq"; snprintf(operand,sizeof(operand),"x jt %d jf %d",n+1+p->jt,n+1+p->jf); break;
++    case BPF_JMP|BPF_JSET|BPF_X:
++        op="jset"; snprintf(operand,sizeof(operand),"x jt %d jf %d",n+1+p->jt,n+1+p->jf); break;
++    /* RET */
++    case BPF_RET|BPF_K:
++        op="ret"; snprintf(operand,sizeof(operand),"#%d",v); break;
++    case BPF_RET|BPF_A:
++        op="ret"; snprintf(operand,sizeof(operand),"a"); break;
++    /* MISC */
++    case BPF_MISC|BPF_TAX: op="tax"; snprintf(operand,sizeof(operand),""); break;
++    case BPF_MISC|BPF_TXA: op="txa"; snprintf(operand,sizeof(operand),""); break;
++    default:
++        op="???"; snprintf(operand,sizeof(operand),"#0x%x",(unsigned)v);
++        break;
++    }
++
++    snprintf(image_buf, sizeof(image_buf), "(%03d) %-8s %s", n, op, operand);
++    return image_buf;
++}
