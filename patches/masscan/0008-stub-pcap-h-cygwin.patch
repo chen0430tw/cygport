@@ -1,0 +1,18 @@
+diff --git a/src/stub-pcap.h b/src/stub-pcap.h
+index 1bac175..e901935 100755
+--- a/src/stub-pcap.h
++++ b/src/stub-pcap.h
+@@ -26,6 +26,13 @@
+ #elif __OpenBSD__
+ #include <net/bpf.h>
+ #define pcap_timeval bpf_timeval
++#elif defined(__CYGWIN__)
++/* Cygwin 'long' is 64-bit (LP64), but Npcap/wpcap.dll uses Windows 32-bit
++ * 'long' in pcap_pkthdr. Use 'int' to match the actual binary ABI. */
++struct pcap_timeval {
++        int     tv_sec;
++        int     tv_usec;
++};
+ #else
+ struct pcap_timeval {
+         long    tv_sec;         /* seconds */

@@ -7,7 +7,8 @@
 #include "../include/cygnet.h"
 
 /* ── ifname.c ────────────────────────────────────────────────────────────── */
-void cygnet_ifname_dump(void);   /* debug: print full interface map */
+void  cygnet_ifname_dump(void);               /* debug: print full interface map */
+DWORD cygnet_npf_to_ifindex(const char *npf); /* NPF path → Windows IfIndex */
 
 /* ── npcap_loader.c ─────────────────────────────────────────────────────── */
 /* Used by ifname.c to enumerate Npcap devices during cache build */

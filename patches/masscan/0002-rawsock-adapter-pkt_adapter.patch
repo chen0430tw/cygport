@@ -1,0 +1,14 @@
+diff --git a/src/rawsock-adapter.h b/src/rawsock-adapter.h
+index 321676f..d25376d 100644
+--- a/src/rawsock-adapter.h
++++ b/src/rawsock-adapter.h
+@@ -11,6 +11,9 @@ struct Adapter
+     unsigned vlan_id;
+     double pt_start;
+     int link_type;
++#if defined(WIN32) || defined(__CYGWIN__)
++    void *pkt_adapter; /* Packet.dll direct adapter handle (for WiFi send) */
++#endif
+ };
+ 
+ 

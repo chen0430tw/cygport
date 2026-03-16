@@ -180,6 +180,23 @@ static void build_cache(void)
     free(addrs);
 }
 
+/* ── Internal: NPF path → Windows interface index ───────────────────────── */
+DWORD cygnet_npf_to_ifindex(const char *npf)
+{
+    InitOnceExecuteOnce(&init_once, build_cache_once, NULL, NULL);
+
+    EnterCriticalSection(&cache_lock);
+    for (int i = 0; i < cache_sz; i++) {
+        if (strcasecmp(cache[i].npf, npf) == 0) {
+            DWORD idx = cache[i].ifindex;
+            LeaveCriticalSection(&cache_lock);
+            return idx;
+        }
+    }
+    LeaveCriticalSection(&cache_lock);
+    return 0;  /* 0 = not found; WinDivert will pick default route */
+}
+
 /* ── Debug dump (for development) ───────────────────────────────────────── */
 void cygnet_ifname_dump(void)
 {

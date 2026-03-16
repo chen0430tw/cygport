@@ -40,11 +40,20 @@
 static HMODULE hWD = NULL;
 static INIT_ONCE wd_once = INIT_ONCE_STATIC_INIT;
 
-typedef HANDLE (WINAPI *pfn_Open)  (const char*, int, INT16, UINT64);
-typedef BOOL   (WINAPI *pfn_Recv)  (HANDLE, void*, UINT, UINT*, void*);
-typedef BOOL   (WINAPI *pfn_Send)  (HANDLE, const void*, UINT, UINT, void*);
-typedef BOOL   (WINAPI *pfn_Close) (HANDLE);
+typedef HANDLE (WINAPI *pfn_Open)    (const char*, int, INT16, UINT64);
+typedef BOOL   (WINAPI *pfn_Recv)    (HANDLE, void*, UINT, UINT*, void*);
+typedef BOOL   (WINAPI *pfn_Send)    (HANDLE, const void*, UINT, UINT*, void*);
+typedef BOOL   (WINAPI *pfn_Close)   (HANDLE);
 typedef BOOL   (WINAPI *pfn_SetParam)(HANDLE, int, UINT64);
+
+/* WinDivert WINDIVERT_ADDRESS binary ABI: 8+4+4+64 = 80 bytes */
+typedef struct {
+    INT64  Timestamp;
+    UINT32 Flags;      /* bit17 = Outbound */
+    UINT32 Reserved2;
+    UINT8  Network[64]; /* [0..3] = IfIdx (UINT32 LE), [4..7] = SubIfIdx */
+} WD_ADDRESS;
+#define WD_OUTBOUND (1u << 17)
 
 static pfn_Open     wd_Open;
 static pfn_Recv     wd_Recv;
@@ -101,6 +110,7 @@ typedef struct {
     volatile LONG   stop;
     int             snaplen;
     int             datalink;
+    DWORD           ifidx;      /* Windows interface index for WinDivertSend */
     char            errbuf[PCAP_ERRBUF_SIZE];
     /* last received packet (for pcap_next_ex) */
     struct pcap_pkthdr last_hdr;
@@ -140,8 +150,6 @@ static DWORD WINAPI recv_thread(LPVOID arg)
         }
         if (pktlen == 0) continue;
 
-        SYSTEMTIME st;
-        GetSystemTime(&st);
         UINT32 caplen   = (pktlen < (UINT)h->snaplen) ? pktlen : (UINT)h->snaplen;
         UINT32 tv_sec   = (UINT32)time(NULL);
         UINT32 tv_usec  = 0;
@@ -175,6 +183,7 @@ pcap_t *cygnet_windivert_open(const char *dev, int snaplen,
     h->magic   = CYGNET_MAGIC;
     h->snaplen = snaplen > 0 ? snaplen : 65535;
     h->datalink = DLT_RAW;  /* WinDivert delivers IP packets (no Ethernet) */
+    h->ifidx   = cygnet_npf_to_ifindex(dev);  /* 0 = let WinDivert pick default route */
 
     /* Open WinDivert handle */
     h->hWD = wd_Open("true", WINDIVERT_LAYER_NETWORK, 0, 0);
@@ -208,8 +217,6 @@ pcap_t *cygnet_windivert_open(const char *dev, int snaplen,
         return NULL;
     }
 
-    fprintf(stderr, "[cygnet/WinDivert] opened %s (snaplen=%d, DLT_RAW)\n",
-            dev, h->snaplen);
     /* Return CygnetHandle directly as pcap_t* — handle_of() detects via magic */
     return (pcap_t *)h;
 }
@@ -305,6 +312,45 @@ int cygnet_windivert_next_ex(pcap_t *p,
     return 1;
 }
 
+/* ── Public: next_packet (ABI-safe, returns caplen directly) ─────────────── */
+/* Avoids struct pcap_pkthdr ABI mismatch between cygnet (24-byte) and
+ * masscan stub-pcap.h (16-byte) due to timeval size difference.
+ * Returns: 0 = no packet yet, >0 = caplen of received packet, -1 = error */
+int cygnet_windivert_next_packet(pcap_t *p, const u_char **data_out)
+{
+    CygnetHandle *h = handle_of(p);
+    if (!h) return -1;
+
+    u_char wire[PIPE_HDR_SZ];
+    DWORD nread;
+
+    DWORD avail = 0;
+    if (!PeekNamedPipe(h->hPipeRead, NULL, 0, NULL, &avail, NULL) || avail == 0)
+        return 0;
+
+    if (!ReadFile(h->hPipeRead, wire, PIPE_HDR_SZ, &nread, NULL) ||
+        nread < PIPE_HDR_SZ)
+        return -1;
+
+    UINT32 caplen;
+    memcpy(&caplen, wire + 0, 4);
+    if (caplen > 65535) return -1;
+
+    free(h->last_pkt);
+    h->last_pkt = malloc(caplen > 0 ? caplen : 1);
+    if (!h->last_pkt) return -1;
+    h->last_pkt_cap = (int)caplen;
+
+    if (caplen > 0) {
+        if (!ReadFile(h->hPipeRead, h->last_pkt, caplen, &nread, NULL) ||
+            nread < caplen)
+            return -1;
+    }
+
+    *data_out = h->last_pkt;
+    return (int)caplen;
+}
+
 /* ── Public: dispatch ────────────────────────────────────────────────────── */
 int cygnet_windivert_dispatch(pcap_t *p, int cnt, pcap_handler cb, u_char *user)
 {
@@ -332,8 +378,14 @@ int cygnet_windivert_inject(pcap_t *p, const void *buf, int size)
 {
     CygnetHandle *h = handle_of(p);
     if (!h || !wd_Send) return PCAP_ERROR;
+
+    WD_ADDRESS addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.Flags = WD_OUTBOUND;
+    memcpy(addr.Network, &h->ifidx, sizeof(DWORD));  /* Network[0..3] = IfIdx */
+
     UINT sent = 0;
-    if (!wd_Send(h->hWD, buf, (UINT)size, sent, NULL)) return PCAP_ERROR;
+    if (!wd_Send(h->hWD, buf, (UINT)size, &sent, &addr)) return PCAP_ERROR;
     return (int)sent;
 }
 

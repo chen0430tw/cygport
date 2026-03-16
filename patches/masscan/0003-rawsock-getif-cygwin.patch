@@ -1,0 +1,29 @@
+diff --git a/src/rawsock-getif.c b/src/rawsock-getif.c
+index d30da40..16a4675 100755
+--- a/src/rawsock-getif.c
++++ b/src/rawsock-getif.c
+@@ -393,7 +393,7 @@ int rawsock_get_default_interface(char *ifname, size_t sizeof_ifname)
+ #endif
+ 
+ 
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+ /* From:
+  * https://stackoverflow.com/questions/10972794/undefined-reference-to-getadaptersaddresses20-but-i-included-liphlpapi
+  * I think this fixed issue #734
+@@ -402,8 +402,14 @@ int rawsock_get_default_interface(char *ifname, size_t sizeof_ifname)
+ #undef _WIN32_WINNT
+ #define _WIN32_WINNT 0x501
+ #endif
+-
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifdef __CYGWIN__
++#include <windows.h>
++#else
+ #include <winsock2.h>
++#endif
+ #include <iphlpapi.h>
+ #include "massip-parse.h"
+ 

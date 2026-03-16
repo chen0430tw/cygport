@@ -1,0 +1,29 @@
+diff --git a/src/rawsock-getroute.c b/src/rawsock-getroute.c
+index 639233a..838ebdf 100644
+--- a/src/rawsock-getroute.c
++++ b/src/rawsock-getroute.c
+@@ -423,7 +423,7 @@ int rawsock_get_default_gateway(const char *ifname, unsigned *ipv4)
+ #endif
+ 
+ 
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+ /* From:
+  * https://stackoverflow.com/questions/10972794/undefined-reference-to-getadaptersaddresses20-but-i-included-liphlpapi
+  * I think this fixes issue #734
+@@ -432,8 +432,14 @@ int rawsock_get_default_gateway(const char *ifname, unsigned *ipv4)
+ #undef _WIN32_WINNT
+ #define _WIN32_WINNT 0x501
+ #endif
+-
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifdef __CYGWIN__
++#include <windows.h>
++#else
+ #include <winsock2.h>
++#endif
+ #include <iphlpapi.h>
+ #ifdef _MSC_VER
+ #pragma comment(lib, "IPHLPAPI.lib")

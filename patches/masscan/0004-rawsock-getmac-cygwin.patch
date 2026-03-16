@@ -1,0 +1,29 @@
+diff --git a/src/rawsock-getmac.c b/src/rawsock-getmac.c
+index bc44d13..cd4ea10 100644
+--- a/src/rawsock-getmac.c
++++ b/src/rawsock-getmac.c
+@@ -75,7 +75,7 @@ end:
+ 
+ /*****************************************************************************
+  *****************************************************************************/
+-#elif defined(WIN32)
++#elif defined(WIN32) || defined(__CYGWIN__)
+  /* From:
+   * https://stackoverflow.com/questions/10972794/undefined-reference-to-getadaptersaddresses20-but-i-included-liphlpapi
+   * I think this fixes issue #734
+@@ -84,7 +84,15 @@ end:
+ #undef _WIN32_WINNT
+ #define _WIN32_WINNT 0x501
+ #endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifdef __CYGWIN__
++/* On Cygwin, avoid winsock2.h which conflicts with Cygwin's sys/select.h */
++#include <windows.h>
++#else
+ #include <winsock2.h>
++#endif
+ #include <iphlpapi.h>
+ #ifdef _MSC_VER
+ #pragma comment(lib, "IPHLPAPI.lib")

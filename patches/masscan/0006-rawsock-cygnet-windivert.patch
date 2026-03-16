@@ -1,0 +1,222 @@
+diff --git a/src/rawsock.c b/src/rawsock.c
+index 2d82d9f..77c2963 100755
+--- a/src/rawsock.c
++++ b/src/rawsock.c
+@@ -24,14 +24,92 @@
+ 
+ static int is_pcap_file = 0;
+ 
+-#ifdef WIN32
+-#include <winsock.h>
++#if defined(WIN32) || defined(__CYGWIN__)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
+ #include <iphlpapi.h>
+ 
+ #if defined(_MSC_VER)
+ #pragma comment(lib, "IPHLPAPI.lib")
+ #endif
+ 
++#ifdef __CYGWIN__
++/*
++ * Cygwin send+receive via cygnet.dll (WinDivert backend).
++ *
++ * cygnet abstracts WinDivert (and optionally Npcap) behind a pcap_t* interface.
++ * We open a cygnet handle at adapter init time and store it in adapter->pcap.
++ * The pkt_adapter field signals that cygnet is active.
++ *
++ * SEND: strip 14-byte Ethernet header, call cygnet_windivert_inject().
++ * RECV: call cygnet_windivert_next_ex(), prepend fake 14-byte Ethernet header.
++ */
++#include <cygnet.h>
++
++/* cygnet WinDivert pcap API — not yet in public cygnet.h */
++typedef unsigned char u_char;
++extern pcap_t *cygnet_windivert_open(const char *dev, int snaplen,
++                                      int promisc, int timeout_ms,
++                                      char *errbuf);
++extern int     cygnet_windivert_inject(pcap_t *p, const void *buf, int size);
++extern int     cygnet_windivert_next_ex(pcap_t *p,
++                                         struct pcap_pkthdr **hdr,
++                                         const u_char **data);
++
++/*
++ * cygnet is compiled with Cygwin LP64 pcap.h: struct timeval = 16 bytes,
++ * so pcap_pkthdr = 24 bytes with caplen at offset +16.
++ * masscan's stub-pcap.h uses int timeval = 8 bytes → caplen at offset +8.
++ * Use cygnet_pkthdr_t to read caplen at the correct LP64 offset.
++ */
++typedef struct {
++    long     ts_sec;   /* 8 bytes (LP64 Cygwin) */
++    long     ts_usec;  /* 8 bytes (LP64 Cygwin) */
++    unsigned caplen;   /* offset 16 */
++    unsigned len;      /* offset 20 */
++} cygnet_pkthdr_t;
++
++/*
++ * link_type = DLT_EN10MB (1): masscan builds full Ethernet+IP+TCP frames.
++ * SEND: strip 14-byte Ethernet header, inject raw IP via WinDivert.
++ * RECV: WinDivert delivers raw IP; prepend fake 14-byte Ethernet header
++ *       so masscan's preprocess_frame (which expects Ethernet) works unchanged.
++ */
++static unsigned char g_cygnet_buf[14 + 65536];
++static const unsigned char g_fake_eth[14] = {
++    0,0,0,0,0,0, 0,0,0,0,0,0, 0x08,0x00
++};
++
++static int cygwin_cygnet_send(pcap_t *pcap,
++                               const unsigned char *eth_pkt, unsigned eth_len)
++{
++    if (eth_len <= 14) return -1;
++    int r = cygnet_windivert_inject(pcap, eth_pkt + 14, (int)(eth_len - 14));
++    return r > 0 ? 0 : -1;
++}
++
++static int cygwin_cygnet_recv(pcap_t *pcap,
++                               const unsigned char **out, unsigned *out_len)
++{
++    struct pcap_pkthdr *hdr_stub;
++    const u_char *data;
++    int r = cygnet_windivert_next_ex(pcap, &hdr_stub, &data);
++    if (r != 1) return 1;
++    /* hdr_stub is actually cygnet_pkthdr_t* (24B, LP64 timeval).
++     * Cast and read caplen at its correct offset (+16). */
++    cygnet_pkthdr_t *hdr = (cygnet_pkthdr_t *)hdr_stub;
++    unsigned caplen = hdr->caplen;
++    if (caplen > 65536) return 1;
++    memcpy(g_cygnet_buf,      g_fake_eth,  14);
++    memcpy(g_cygnet_buf + 14, data,        caplen);
++    *out     = g_cygnet_buf;
++    *out_len = 14 + caplen;
++    return 0;
++}
++#endif /* __CYGWIN__ */
++
+ #elif defined(__GNUC__)
+ #include <unistd.h>
+ #include <sys/types.h>
+@@ -286,7 +364,6 @@ rawsock_send_packet(
+     unsigned length,
+     unsigned flush)
+ {
+-
+     /* Why: this happens in "offline mode", when we are benchmarking the
+      * core algorithms without sending packets. */
+     if (adapter == 0)
+@@ -329,9 +406,17 @@ rawsock_send_packet(
+         return 0;
+     }
+ 
++    /* CYGWIN: cygnet/WinDivert send (checked before Npcap pcap) */
++#ifdef __CYGWIN__
++    if (adapter->pkt_adapter) {
++        return cygwin_cygnet_send((pcap_t*)adapter->pkt_adapter, packet, length);
++    }
++#endif
++
+     /* LIBPCAP */
+-    if (adapter->pcap)
++    if (adapter->pcap) {
+         return PCAP.sendpacket(adapter->pcap, packet, length);
++    }
+ 
+     return 0;
+ }
+@@ -372,14 +457,29 @@ int rawsock_recv_packet(
+         *secs = (unsigned)hdr.ts.tv_sec;
+         *usecs = (unsigned)hdr.ts.tv_usec;
+ 
+-    } else if (adapter->pcap) {
++    }
++#ifdef __CYGWIN__
++    /* cygnet/WinDivert recv: checked before Npcap pcap, after ring */
++    else if (adapter->pkt_adapter) {
++        const unsigned char *pkt_data = NULL;
++        unsigned pkt_len = 0;
++        int ret = cygwin_cygnet_recv((pcap_t*)adapter->pkt_adapter,
++                                     &pkt_data, &pkt_len);
++        if (ret != 0)
++            return 1;   /* no packet yet */
++        *packet = pkt_data;
++        *length = pkt_len;
++        *secs   = (unsigned)time(NULL);
++        *usecs  = 0;
++        return 0;
++    }
++#endif
++    else if (adapter->pcap) {
+         struct pcap_pkthdr hdr;
+ 
+         *packet = PCAP.next(adapter->pcap, &hdr);
+-
+         if (*packet == NULL) {
+             if (is_pcap_file) {
+-                //pixie_time_set_offset(10*100000);
+                 is_tx_done = 1;
+                 is_rx_done = 1;
+             }
+@@ -706,6 +806,35 @@ rawsock_init_adapter(const char *adapter_name,
+         return adapter;
+     }
+ 
++#ifdef __CYGWIN__
++    /*----------------------------------------------------------------
++     * PORTABILITY: CYGWIN — try cygnet/WinDivert before Npcap.
++     *
++     * On Cygwin, Npcap pcap_sendpacket fails (0x8034001F) for raw
++     * packet injection. cygnet_windivert_open() uses WinDivert.sys at
++     * the IP/WFP layer and works on both Ethernet and WiFi adapters.
++     * If it succeeds we skip Npcap entirely.
++     *----------------------------------------------------------------*/
++    {
++        char wd_errbuf[PCAP_ERRBUF_SIZE] = "";
++        pcap_t *wd = cygnet_windivert_open(adapter_name,
++                                            65536, 0, 1000,
++                                            wd_errbuf);
++        if (wd) {
++            adapter->pkt_adapter = wd;
++            /* Do NOT set adapter->pcap here — cygnet handle is not a real
++             * wpcap pcap_t and would crash if PCAP.* functions are called on it.
++             * send/recv check pkt_adapter first, independently of pcap. */
++            adapter->link_type = 1;  /* DLT_EN10MB — masscan builds Ethernet frames;
++                                      * send strips header, recv prepends fake header */
++            fprintf(stderr, "[+] cygnet/WinDivert opened (adapter: %s)\n",
++                    adapter_name);
++            return adapter;   /* skip Npcap */
++        }
++        fprintf(stderr, "[-] cygnet: %s — falling back to Npcap\n", wd_errbuf);
++    }
++#endif
++
+     /*----------------------------------------------------------------
+      * Kludge: for using files
+      *----------------------------------------------------------------*/
+@@ -733,7 +862,7 @@ rawsock_init_adapter(const char *adapter_name,
+             adapter->pcap = PCAP.open_live(
+                         adapter_name,           /* interface name */
+                         65536,                  /* max packet size */
+-                        8,                      /* promiscuous mode */
++                        0,                      /* promiscuous mode: 0=off for Cygwin WiFi */
+                         1000,                   /* read timeout in milliseconds */
+                         errbuf);
+             if (adapter->pcap == NULL) {
+@@ -751,7 +880,7 @@ rawsock_init_adapter(const char *adapter_name,
+                 goto pcap_error;
+             }
+ 
+-            err = PCAP.set_promisc(adapter->pcap, 8);
++            err = PCAP.set_promisc(adapter->pcap, 0); /* 0=off for Cygwin WiFi */
+             if (err) {
+                 PCAP.perror(adapter->pcap, "if: set_promisc");
+                 goto pcap_error;
+@@ -826,6 +955,8 @@ rawsock_init_adapter(const char *adapter_name,
+         adapter->sendq = PCAP.sendqueue_alloc(SENDQ_SIZE);
+ #endif
+ 
++/* cygnet init moved above pcap section — nothing here */
++
+ 
+     return adapter;
+ pcap_error:

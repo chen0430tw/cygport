@@ -1,0 +1,17 @@
+diff --git a/Makefile b/Makefile
+index 866be22..b1579e9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -70,9 +70,9 @@ endif
+ # second here for completeness, or in case I gate tired of hitting my
+ # head with a hammer and want to feel a different sort of pain.
+ ifneq (, $(findstring cygwin, $(SYS)))
+-INCLUDES = -I.
+-LIBS = 
+-FLAGS2 = 
++INCLUDES = -I. -I/d/cygport/cygnet/include
++LIBS = -liphlpapi -L/d/cygport/cygnet -lcygnet
++FLAGS2 =
+ endif
+ 
+ # OpenBSD
