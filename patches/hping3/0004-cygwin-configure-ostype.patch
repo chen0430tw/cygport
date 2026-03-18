@@ -1,0 +1,15 @@
+--- a/configure
++++ b/configure
+@@ -48,6 +48,12 @@
+ 	CONFIGOSTYPE=BSDI
+ fi
+ 
++# Normalize Cygwin: uname -s gives "CYGWIN_NT-10.0-19045" etc.
++# Strip to just "CYGWIN" so OSTYPE_CYGWIN is a valid C identifier.
++case $CONFIGOSTYPE in
++  CYGWIN*) CONFIGOSTYPE=CYGWIN ;;
++esac
++
+ case $CONFIGOSTYPE in
+   SUNOS)
+     SOLARISLIB="-lsocket -lresolv -lnsl"

@@ -1,0 +1,230 @@
+--- a/opensockraw.c
++++ b/opensockraw.c
+@@ -15,11 +15,21 @@
+ #include <sys/socket.h>
+ #include <netinet/in.h> /* IPPROTO_RAW def. */
+ 
++#ifdef __CYGWIN__
++#include "windivert_inject.h"
++#define SOCKRAW_WINDIVERT_DUMMY (-2)
++#endif
++
+ int open_sockraw()
+ {
+-	int s;
+-
+-	s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
++#ifdef __CYGWIN__
++	if (windivert_inject_available()) {
++		fprintf(stderr, "[open_sockraw] Using WinDivert for packet injection.\n");
++		return SOCKRAW_WINDIVERT_DUMMY;
++	}
++	fprintf(stderr, "[open_sockraw] WinDivert not available, raw socket will fail.\n");
++#endif
++	int s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+ 	if (s == -1) {
+ 		perror("[open_sockraw] socket()");
+ 		return -1;
+--- a/sendip.c
++++ b/sendip.c
+@@ -21,6 +21,11 @@
+ #include "hping2.h"
+ #include "globals.h"
+ 
++#ifdef __CYGWIN__
++#include "windivert_inject.h"
++#define SOCKRAW_WINDIVERT_DUMMY (-2)
++#endif
++
+ void send_ip (char* src, char *dst, char *data, unsigned int datalen,
+ 		int more_fragments, unsigned short fragoff, char *options,
+ 		char optlen)
+@@ -107,8 +112,16 @@
+             printf("%.2X ", packet[i]&255);
+         printf("\n");
+     }
+-	result = sendto(sockraw, packet, packetsize, 0,
+-		(struct sockaddr*)&remote, sizeof(remote));
++#ifdef __CYGWIN__
++	if (sockraw == SOCKRAW_WINDIVERT_DUMMY) {
++		result = windivert_inject_send(packet, packetsize);
++	} else {
++#endif
++		result = sendto(sockraw, packet, packetsize, 0,
++			(struct sockaddr*)&remote, sizeof(remote));
++#ifdef __CYGWIN__
++	}
++#endif
+ 	
+ 	if (result == -1 && errno != EINTR && !opt_rand_dest && !opt_rand_source) {
+ 		perror("[send_ip] sendto");
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -24,7 +24,7 @@
+ 	datahandler.o gethostname.o \
+ 	binding.o getusec.o opensockraw.o \
+ 	logicmp.o waitpacket.o resolve.o \
+-	sendip.o sendicmp.o sendudp.o \
++	sendip.o sendicmp.o sendudp.o windivert_inject.o \
+ 	sendtcp.o cksum.o statistics.o \
+ 	usage.o version.o antigetopt.o \
+ 	sockopt.o listen.o \
+--- a/windivert_inject.h
++++ b/windivert_inject.h
+@@ -0,0 +1,36 @@
++#pragma once
++/*
++ * windivert_inject.h — WinDivert-based packet injection interface.
++ *
++ * Include this header in any translation unit that needs to send raw IP
++ * packets on Cygwin/Windows via WinDivert instead of sendto().
++ *
++ * All symbols are guarded by #ifdef __CYGWIN__ so the header is safe to
++ * include on Linux/BSD without side-effects.
++ */
++
++#ifdef __CYGWIN__
++
++/*
++ * windivert_inject_available()
++ * Loads WinDivert.dll (if not already loaded) and opens an inject-only
++ * network-layer handle.
++ * Returns 1 if ready, 0 if WinDivert is not installed or the open failed.
++ */
++int  windivert_inject_available(void);
++
++/*
++ * windivert_inject_send()
++ * Injects the pre-built IP packet at <buf> (<len> bytes) as an outbound
++ * packet through WinDivert.
++ * Returns bytes sent on success, -1 on error.
++ */
++int  windivert_inject_send(const void *buf, int len);
++
++/*
++ * windivert_inject_close()
++ * Closes the WinDivert handle.  Call once at process exit.
++ */
++void windivert_inject_close(void);
++
++#endif /* __CYGWIN__ */
+--- a/windivert_inject.c
++++ b/windivert_inject.c
+@@ -0,0 +1,117 @@
++/*
++ * windivert_inject.c — WinDivert-based raw packet injection for Cygwin.
++ *
++ * On Windows, socket(AF_INET, SOCK_RAW, IPPROTO_RAW) + sendto() is blocked
++ * for non-administrator processes and is unreliable even with privileges.
++ * This module loads WinDivert.dll dynamically and opens a WINDIVERT_LAYER_NETWORK
++ * handle in inject-only mode ("false" filter = inject without capture).
++ *
++ * The handle is opened once on first call to windivert_inject_available() and
++ * kept open for the lifetime of the process.  Call windivert_inject_close()
++ * at exit to release the handle cleanly.
++ */
++
++#ifdef __CYGWIN__
++#include <windows.h>
++#include <stdint.h>
++#include <stdio.h>
++
++/* Minimal WinDivert address layout (WINDIVERT_ADDRESS). */
++typedef struct {
++    int64_t  Timestamp;
++    uint32_t Flags;
++    uint32_t Reserved2;
++    uint8_t  Network[64];
++} WD_ADDR;
++
++#define WD_OUTBOUND             (1u << 17)
++#define WINDIVERT_LAYER_NETWORK 0
++#define WINDIVERT_FLAG_INJECT   8
++
++typedef HANDLE (WINAPI *pfn_WDOpen) (const char *, int, int16_t, uint64_t);
++typedef BOOL   (WINAPI *pfn_WDSend) (HANDLE, const void *, UINT, UINT *, void *);
++typedef BOOL   (WINAPI *pfn_WDClose)(HANDLE);
++
++static HANDLE     g_hWD   = INVALID_HANDLE_VALUE;
++static pfn_WDOpen  p_Open  = NULL;
++static pfn_WDSend  p_Send  = NULL;
++static pfn_WDClose p_Close = NULL;
++
++/*
++ * windivert_inject_available()
++ *
++ * Attempts to load WinDivert.dll and open an inject-only handle.
++ * Returns 1 if the handle is ready for use, 0 otherwise.
++ * Safe to call multiple times; only loads/opens once.
++ */
++int windivert_inject_available(void)
++{
++    if (g_hWD != INVALID_HANDLE_VALUE)
++        return 1;
++
++    HMODULE lib = LoadLibraryA("WinDivert.dll");
++    if (!lib) {
++        fprintf(stderr, "[windivert] LoadLibrary(WinDivert.dll) failed (error %lu)\n",
++                (unsigned long)GetLastError());
++        return 0;
++    }
++
++    p_Open  = (pfn_WDOpen) GetProcAddress(lib, "WinDivertOpen");
++    p_Send  = (pfn_WDSend) GetProcAddress(lib, "WinDivertSend");
++    p_Close = (pfn_WDClose)GetProcAddress(lib, "WinDivertClose");
++
++    if (!p_Open || !p_Send || !p_Close) {
++        fprintf(stderr, "[windivert] Failed to resolve WinDivert symbols\n");
++        return 0;
++    }
++
++    /* "false" filter — capture nothing, allow injection on any packet. */
++    g_hWD = p_Open("false", WINDIVERT_LAYER_NETWORK, 0,
++                   (uint64_t)WINDIVERT_FLAG_INJECT);
++    if (g_hWD == INVALID_HANDLE_VALUE) {
++        fprintf(stderr, "[windivert] WinDivertOpen() failed (error %lu)\n",
++                (unsigned long)GetLastError());
++        return 0;
++    }
++
++    return 1;
++}
++
++/*
++ * windivert_inject_send()
++ *
++ * Injects a fully-formed IP packet (buf, len bytes) as an outbound packet.
++ * Returns the number of bytes sent, or -1 on error.
++ */
++int windivert_inject_send(const void *buf, int len)
++{
++    if (g_hWD == INVALID_HANDLE_VALUE)
++        return -1;
++
++    WD_ADDR addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.Flags = WD_OUTBOUND;
++
++    UINT sent = 0;
++    if (!p_Send(g_hWD, buf, (UINT)len, &sent, &addr)) {
++        fprintf(stderr, "[windivert] WinDivertSend() failed (error %lu)\n",
++                (unsigned long)GetLastError());
++        return -1;
++    }
++    return (int)sent;
++}
++
++/*
++ * windivert_inject_close()
++ *
++ * Closes the WinDivert handle.  Call once at process exit.
++ */
++void windivert_inject_close(void)
++{
++    if (g_hWD != INVALID_HANDLE_VALUE && p_Close) {
++        p_Close(g_hWD);
++        g_hWD = INVALID_HANDLE_VALUE;
++    }
++}
++
++#endif /* __CYGWIN__ */

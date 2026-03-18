@@ -1,0 +1,27 @@
+--- a/ext/pcaprub_c/extconf.rb
++++ b/ext/pcaprub_c/extconf.rb
+@@ -61,6 +61,24 @@
+ 
+   have_library("wpcap", "pcap_open_live")
+   have_library("wpcap", "pcap_setnonblock")
++elsif /cygwin/ =~ RUBY_PLATFORM
++  # Cygwin: use Npcap SDK (same as MinGW, already installed at /opt/cygwin-port)
++  default_cygwin_sdk = '/opt/cygwin-port'
++
++  pcap_dir        = with_config("pcap-dir", default_cygwin_sdk)
++  pcap_includedir = with_config("pcap-includedir", pcap_dir + "/include")
++  pcap_libdir     = with_config("pcap-libdir", pcap_dir + "/lib")
++
++  $CFLAGS  = "-DWIN32 -I#{pcap_includedir}"
++  $CFLAGS += " -g" if with_config("debug")
++  $LDFLAGS = "-L#{pcap_libdir}"
++  $LDFLAGS += " -g" if with_config("debug")
++
++  have_header("ruby/thread.h")
++  have_func("rb_thread_blocking_region") # Pre ruby 2.2
++  have_func("rb_thread_call_without_gvl") # Post ruby 2.2
++  have_library("wpcap", "pcap_open_live")
++  have_library("wpcap", "pcap_setnonblock")
+ else
+   libdir = RbConfig::CONFIG['libdir']
+   includedir = RbConfig::CONFIG['includedir']

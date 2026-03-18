@@ -1,0 +1,103 @@
+--- a/ext/pcaprub_c/pcaprub.c
++++ b/ext/pcaprub_c/pcaprub.c
+@@ -16,6 +16,10 @@
+   #endif
+ #endif
+ 
++#ifdef __CYGWIN__
++  #include <windows.h>
++#endif
++
+ #if !defined(WIN32)
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+@@ -26,7 +30,7 @@
+ static VALUE rb_cPcap, rb_cPkt;
+ static VALUE ePCAPRUBError, eDumperError, eBindingError, eBPFilterError, eLinkTypeError;
+ 
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+ static VALUE rbpcap_thread_wait_handle(HANDLE fno);
+ #endif
+ 
+@@ -232,7 +236,7 @@
+     rb_raise(rb_eArgError, "Monitor mode must be a boolean");
+   }
+ 
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+   // monitor mode support was disabled in WinPcap 4.0.2
+   rb_raise(ePCAPRUBError, "set monitor mode not supported in WinPcap");
+ #else
+@@ -838,7 +842,7 @@
+   Data_Get_Struct(self, rbpcap_t, rbp);
+ 
+ 	if(! rbpcap_ready(rbp)) return self;
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+   /* WinPcap does not have a pcap_inject call we use pcap_sendpacket, if it suceedes
+    * we simply return the amount of packets request to inject, else we fail.
+    */
+@@ -973,7 +977,7 @@
+ rbpcap_each_data(VALUE self)
+ {
+   rbpcap_t *rbp;
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+   HANDLE fno;
+ #else
+   int fno = -1;
+@@ -983,7 +987,7 @@
+ 
+   if(! rbpcap_ready(rbp)) return self;
+ 
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+   fno = (HANDLE)pcap_getevent(rbp->pd);
+ #else
+   fno = pcap_get_selectable_fd(rbp->pd);
+@@ -993,7 +997,7 @@
+   	VALUE packet = rbpcap_next_data(self);
+   	if(packet == Qnil && rbp->type == OFFLINE) break;
+     if(packet == Qnil && rbp->type == DEAD) break;
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+ 	  packet == Qnil ? rbpcap_thread_wait_handle(fno) : rb_yield(packet);
+ #else
+ 	  packet == Qnil ? rb_thread_wait_fd(fno) : rb_yield(packet);
+@@ -1016,7 +1020,7 @@
+ {
+   rbpcap_t *rbp;
+ 
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+   HANDLE fno;
+ #else
+   int fno = -1;
+@@ -1025,7 +1029,7 @@
+   Data_Get_Struct(self, rbpcap_t, rbp);
+   if(! rbpcap_ready(rbp)) return self;
+ 
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+   fno = (HANDLE)pcap_getevent(rbp->pd);
+ #else
+   fno = pcap_get_selectable_fd(rbp->pd);
+@@ -1035,7 +1039,7 @@
+   	VALUE packet = rbpcap_next_packet(self);
+   	if(packet == Qnil && rbp->type == OFFLINE) break;
+     if(packet == Qnil && rbp->type == DEAD) break;
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+ 	  packet == Qnil ? rbpcap_thread_wait_handle(fno) : rb_yield(packet);
+ #else
+ 	  packet == Qnil ? rb_thread_wait_fd(fno) : rb_yield(packet);
+@@ -1243,7 +1247,7 @@
+   return rb_str_new((char *) rbpacket->pkt, rbpacket->hdr.caplen);
+ }
+ 
+-#if defined(WIN32)
++#if defined(WIN32) || defined(__CYGWIN__)
+ static void *
+ rbpcap_thread_wait_handle_blocking(void *data)
+ {

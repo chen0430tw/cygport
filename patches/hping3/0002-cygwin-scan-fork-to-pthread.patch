@@ -1,0 +1,150 @@
+--- a/scan.c
++++ b/scan.c
+@@ -19,8 +19,7 @@
+ #if 0
+ #include <sys/ipc.h>
+ #endif
+-#include <sys/shm.h>
+-#include <sys/sem.h>
++#include <pthread.h>
+ #include <unistd.h>
+ #include <netdb.h>
+ #include <sys/time.h>
+@@ -65,62 +64,27 @@
+  * sendinf half, while the 'active' field is set by the receiver
+  * and tested by the sender so atomicity isn't an issue. */
+ struct portinfo {
+-	int active;
++	volatile int active;
+ 	int retry;
+-	time_t sentms; /* Upss... added this that requires locking, FIXME */
++	volatile time_t sentms; /* Upss... added this that requires locking, FIXME */
+ };
+ 
+-/* ------------------------- shared memory related -------------------------- */
++/* forward declarations */
++static void sender(struct portinfo *pi);
++static void receiver(struct portinfo *pi, int childpid);
+ 
+-static int id;	/* shared memory id */
++/* ------------------------- thread functions ------------------------------ */
+ 
+-static int shm_creat(int size)
++static void *sender_thread(void *arg)
+ {
+-	id = shmget(IPC_PRIVATE, size, IPC_CREAT | 0777);
+-	if (id == -1)
+-	{
+-		perror("[shm_creat] shmget");
+-		return -1; /* on error -1 */
+-	}
+-	return id; /* on success > 0 */
+-}
+-
+-static void *shm_attach(void)
+-{
+-	void *shared;
+-
+-	shared = shmat(id, 0, 0);
+-	if (shared == (void*) -1)
+-	{
+-		perror("[shm_attach] shmat");
+-		return NULL; /* on error NULL */
+-	}
+-	return shared; /* on success the address */
+-}
+-
+-static int shm_rm(void)
+-{
+-	struct shmid_ds shmemds;
+-
+-	return shmctl(id, IPC_RMID, &shmemds);
++	sender((struct portinfo *)arg);
++	return NULL;
+ }
+ 
+-static int shm_detach(void *addr)
++static void *receiver_thread(void *arg)
+ {
+-	return shmdt(addr);
+-}
+-
+-static void *shm_init(int size)
+-{
+-	if (shm_creat(size) == -1)
+-		return NULL;
+-	return shm_attach();
+-}
+-
+-static void shm_close(void *addr)
+-{
+-	shm_detach(addr);
+-	shm_rm();
++	receiver((struct portinfo *)arg, 0);
++	return NULL;
+ }
+ 
+ /* ------------------------------ locking ---------------------------------- */
+@@ -499,22 +463,21 @@
+ {
+ 	struct portinfo *pi;
+ 	int ports = 0, i;
+-	int childpid;
++	pthread_t sender_tid, receiver_tid;
+ 
+-	pi = shm_init(sizeof(*pi)*(MAXPORT+2));
+-	pi[MAXPORT+1].active = 0; /* hold the average RTT */
++	pi = calloc(MAXPORT+2, sizeof(*pi));
+ 	if (pi == NULL) {
+-		fprintf(stderr, "Unable to create the shared memory");
+-		shm_close(pi);
++		fprintf(stderr, "Unable to allocate port info memory");
+ 		exit(1);
+ 	}
++	pi[MAXPORT+1].active = 0; /* hold the average RTT */
+ 	for (i = 0; i <= MAXPORT; i++) {
+ 		pi[i].active = 0;
+ 		pi[i].retry = opt_scan_probes;
+ 	}
+ 	if (parse_ports(pi, opt_scanports)) {
+ 		fprintf(stderr, "Ports syntax error for scan mode\n");
+-		shm_close(pi);
++		free(pi);
+ 		exit(1);
+ 	}
+ 	for (i = 0; i <= MAXPORT; i++) {
+@@ -528,25 +491,13 @@
+ 	fprintf(stderr, "|port| serv name |  flags  |ttl| id  | win | len |\n");
+ 	fprintf(stderr, "+----+-----------+---------+---+-----+-----+-----+\n");
+ 
+-	/* We are ready to fork, the input and output parts
+-	 * are separated processes */
+-	if ((childpid = fork()) == -1) {
+-		perror("fork");
+-		shm_close(pi);
+-		exit(1);
+-	}
+-	/* The parent is the receiver, the child the sender.
+-	 * it's almost the same but this way is simpler
+-	 * to make it working in pipe with other commands like grep. */
+-	if (childpid) { /* parent */
+-		Signal(SIGCHLD, do_exit);
+-		Signal(SIGINT, do_exit);
+-		Signal(SIGTERM, do_exit);
+-		receiver(pi, childpid);
+-	} else {	/* child */
+-		Signal(SIGINT, do_exit);
+-		Signal(SIGTERM, do_exit);
+-		sender(pi);
+-	}
+-	/* UNREACHED */
++	Signal(SIGINT, do_exit);
++	Signal(SIGTERM, do_exit);
++
++	/* Launch receiver and sender as threads sharing the heap-allocated pi */
++	pthread_create(&receiver_tid, NULL, receiver_thread, pi);
++	pthread_create(&sender_tid, NULL, sender_thread, pi);
++	pthread_join(receiver_tid, NULL);
++	pthread_cancel(sender_tid);
++	free(pi);
+ }

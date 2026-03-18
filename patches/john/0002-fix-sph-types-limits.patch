@@ -1,0 +1,9 @@
+--- a/src/sph_types.h
++++ b/src/sph_types.h
+@@ -52,8 +52,6 @@
+ #endif
+
+-#if !AC_BUILT || HAVE_LIMITS_H
+ #include <limits.h>
+-#endif
+ #include "arch.h"
